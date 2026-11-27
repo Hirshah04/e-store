@@ -1,0 +1,56 @@
+import type { Metadata } from "next"
+import { notFound } from "next/navigation"
+import { getProducts, getProductByHandle } from "@/lib/sheets"
+import { ProductSchema } from "@/components/ProductSchema"
+import ProductDetailClient from "@/components/ProductDetailClient"
+
+// Pre-render product pages; revalidate every 60s and on portal mutations
+export const revalidate = 60
+
+export async function generateStaticParams() {
+  const products = await getProducts()
+  return products.map((p) => ({ handle: p.handle }))
+}
+
+interface PageProps {
+  params: Promise<{ handle: string }>
+}
+
+export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
+  const { handle } = await params
+  const product = await getProductByHandle(handle)
+  if (!product) return { title: "Product Not Found" }
+
+  return {
+    title: product.name,
+    description: product.description || undefined,
+    openGraph: {
+      title: product.name,
+      description: product.description || undefined,
+      images: product.imageUrl ? [{ url: product.imageUrl }] : [],
+    },
+  }
+}
+
+export default async function ProductDetailPage({ params }: PageProps) {
+  const { handle } = await params
+  const product = await getProductByHandle(handle)
+
+  if (!product) notFound()
+
+  // Never expose Active Stock to customer-facing pages
+  const { activeStock: _a, colors, ...rest } = product
+  const publicProduct = {
+    ...rest,
+    colors: Array.isArray(colors)
+      ? colors.map(({ activeStock: _ca, ...cRest }) => cRest)
+      : colors,
+  }
+
+  return (
+    <>
+      <ProductSchema product={publicProduct} />
+      <ProductDetailClient product={publicProduct} />
+    </>
+  )
+}

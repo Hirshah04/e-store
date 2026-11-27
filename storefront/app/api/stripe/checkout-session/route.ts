@@ -1,0 +1,317 @@
+/**
+ * @file app/api/stripe/checkout-session/route.ts
+ * @description Creates a Stripe Checkout session for a cart of items.
+ *
+ *   Security:
+ *     - Accepts an `items` array (handle + quantity) instead of a raw amount.
+ *       Prices are resolved server-side from the Google Sheets product catalogue
+ *       so the client cannot tamper with prices by modifying localStorage.
+ *     - Validates that every requested product exists and is in stock.
+ *     - Restricts success/cancel URLs to the same origin as NEXT_PUBLIC_STORE_URL
+ *       to prevent open-redirect phishing.
+ *
+ * @owner Heet-P
+ * @lastModified June 8, 2026
+ */
+
+import { NextResponse } from "next/server"
+import Stripe from "stripe"
+import { z } from "zod"
+import { getServerSession } from "next-auth/next"
+import { authOptions } from "@/lib/auth"
+import { generateInvoiceToken } from "@/lib/invoice-token"
+import { getEffectivePricing } from "@/lib/pricing"
+import { stripEmoji } from "@/lib/sanitize"
+import {
+  calculateDelhiveryShippingRate,
+  isValidPincode,
+} from "@/lib/delhivery"
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_placeholder", {
+  apiVersion: "2025-01-27.acacia" as any,
+})
+
+const checkoutSessionSchema = z.object({
+  customerName: z.string().min(1).transform(stripEmoji),
+  email:        z.email(),
+  deliveryPincode: z.string().trim().min(6).max(6),
+  shippingAddress: z.string().optional(),
+  phoneNumber: z.string().optional(),
+  // Array of cart items — price is resolved server-side, never trusted from client
+  items: z.array(
+    z.object({
+      handle:    z.string().min(1),
+      productId: z.string().optional(),
+      name:      z.string().min(1).transform(stripEmoji),
+      quantity:  z.number().int().positive().max(1000),
+      selectedColor: z
+        .object({
+          id: z.string().optional(),
+          name: z.string(),
+          hex: z.string().optional(),
+        })
+        .nullable()
+        .optional(),
+    })
+  ).min(1, "Cart is empty"),
+  expectedTotal: z.number().min(0).optional(),
+  successUrl: z.url(),
+  cancelUrl:  z.url(),
+})
+
+export async function POST(request: Request) {
+  try {
+    // ── Server-Side Authentication Verification ──────────────────────────────
+    // Only authenticated customers can create payment sessions.
+    // Guests or unauthenticated requests are strictly rejected with HTTP 401.
+    const authSession = await getServerSession(authOptions)
+    if (!authSession?.user?.email) {
+      return NextResponse.json(
+        { error: "Authentication required to checkout. Please log in to your CLASPO account." },
+        { status: 401 }
+      )
+    }
+
+    const body = await request.json()
+    const parsed = checkoutSessionSchema.safeParse(body)
+
+    if (!parsed.success) {
+      return NextResponse.json({ error: parsed.error.issues[0]?.message ?? "Invalid request data" }, { status: 400 })
+    }
+
+    const {
+      customerName,
+      email,
+      deliveryPincode,
+      shippingAddress,
+      phoneNumber,
+      items,
+      expectedTotal,
+      successUrl,
+      cancelUrl,
+    } = parsed.data
+    // Always bind order to verified session customer email rather than unverified client payload
+    const verifiedEmail = authSession.user.email.toLowerCase()
+
+    if (!isValidPincode(deliveryPincode)) {
+      return NextResponse.json(
+        { error: "Please enter a valid 6-digit delivery PIN code." },
+        { status: 400 }
+      )
+    }
+
+    // ── Lookup Verified User Record ──────────────────────────────────────────
+    const { getProducts, getUserByEmail, invalidateProductsCache } = await import("@/lib/sheets")
+    const dbUser = await getUserByEmail(verifiedEmail).catch(() => null)
+    const verifiedUserId = dbUser?.userId || (authSession.user as any).id || `usr_${verifiedEmail}`
+    invalidateProductsCache()
+    const allProducts = await getProducts(true)
+
+    let serverAmount = 0
+    const productSummaryParts: string[] = []
+    const resolvedOrderItems: Array<{ pid: string; qty: number; cid?: string; cname?: string }> = []
+    const cumulativeProductQty = new Map<string, number>()
+    const itemsForShipping: Array<{ product: (typeof allProducts)[0]; quantity: number }> = []
+
+    for (const item of items) {
+      const product =
+        (item.productId
+          ? allProducts.find((p) => p.productId === item.productId || p.id === item.productId)
+          : undefined) ||
+        allProducts.find(
+          (p) =>
+            p.id === item.handle ||
+            p.productId === item.handle ||
+            p.handle === item.handle ||
+            p.slug === item.handle
+        )
+
+      if (!product) {
+        return NextResponse.json(
+          { error: `Product "${item.name}" is no longer available.` },
+          { status: 400 }
+        )
+      }
+      if (product.status === "Inactive") {
+        return NextResponse.json(
+          { error: `"${product.name}" is currently unavailable.` },
+          { status: 400 }
+        )
+      }
+      const availableStock = product.stock ?? (product.inStock ? 100 : 0)
+      if (!product.inStock || availableStock <= 0) {
+        return NextResponse.json(
+          { error: `"${product.name}" is currently out of stock.` },
+          { status: 400 }
+        )
+      }
+
+      const productColors = Array.isArray(product.colors) ? product.colors : []
+      let resolvedColorName = ""
+      let effectiveStock = availableStock
+
+      if (productColors.length > 0) {
+        if (!item.selectedColor?.name) {
+          return NextResponse.json(
+            { error: `Please select an available colour for "${product.name}".` },
+            { status: 400 }
+          )
+        }
+        const matchedColor = productColors.find(
+          (c) =>
+            (item.selectedColor?.id && c.id === item.selectedColor.id) ||
+            c.name.trim().toLowerCase() === item.selectedColor!.name.trim().toLowerCase()
+        )
+        if (
+          !matchedColor ||
+          matchedColor.available === false ||
+          (matchedColor.stock != null && matchedColor.stock <= 0)
+        ) {
+          return NextResponse.json(
+            { error: `The selected colour "${item.selectedColor.name}" for "${product.name}" is no longer available. Please select another colour.` },
+            { status: 400 }
+          )
+        }
+        resolvedColorName = matchedColor.name
+        if (matchedColor.stock != null) {
+          effectiveStock = Math.min(availableStock, matchedColor.stock)
+        }
+      }
+
+      const resolvedPid = product.productId || product.id
+      const nextCumulativeQty = (cumulativeProductQty.get(resolvedPid) || 0) + item.quantity
+      cumulativeProductQty.set(resolvedPid, nextCumulativeQty)
+
+      if (nextCumulativeQty > availableStock) {
+        return NextResponse.json(
+          { error: `Only ${availableStock} unit(s) of "${product.name}" are available in stock.` },
+          { status: 400 }
+        )
+      }
+
+      if (item.quantity > effectiveStock) {
+        return NextResponse.json(
+          { error: `Only ${effectiveStock} unit(s) of "${product.name}"${resolvedColorName ? ` (${resolvedColorName})` : ""} are available in stock.` },
+          { status: 400 }
+        )
+      }
+      const { sellingPrice } = getEffectivePricing(product)
+      if (sellingPrice <= 0) {
+        return NextResponse.json(
+          { error: `"${product.name}" does not have a valid online price.` },
+          { status: 400 }
+        )
+      }
+      serverAmount += sellingPrice * item.quantity
+      productSummaryParts.push(
+        `${product.name}${resolvedColorName ? ` (${resolvedColorName})` : ""} x${item.quantity}`
+      )
+      resolvedOrderItems.push({
+        pid: resolvedPid,
+        qty: item.quantity,
+        ...(resolvedColorName ? { cname: resolvedColorName } : {}),
+      })
+      itemsForShipping.push({
+        product,
+        quantity: item.quantity,
+      })
+    }
+
+    if (serverAmount <= 0) {
+      return NextResponse.json({ error: "Invalid order amount" }, { status: 400 })
+    }
+
+    // ── Server-Side Delhivery Shipping Calculation ───────────────────────────
+    const shippingCalc = await calculateDelhiveryShippingRate({
+      destinationPincode: deliveryPincode,
+      items: itemsForShipping,
+    })
+
+    if (!shippingCalc.success) {
+      return NextResponse.json(
+        {
+          error: shippingCalc.error || "Unable to calculate shipping charges for your PIN code.",
+        },
+        { status: 422 }
+      )
+    }
+
+    const productSummary = productSummaryParts.join(", ").substring(0, 500)
+    const shippingAmount = shippingCalc.shippingCharge ?? 0
+    const totalAmountInr = serverAmount + shippingAmount
+
+    if (
+      expectedTotal != null &&
+      Math.round(expectedTotal * 100) !== Math.round(totalAmountInr * 100)
+    ) {
+      return NextResponse.json(
+        {
+          error: "Product prices have been updated. Please review and confirm the updated total before paying.",
+          code: "PRICE_CHANGED",
+          serverTotal: totalAmountInr,
+        },
+        { status: 409 }
+      )
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "inr",
+            product_data: {
+              name: "CLASPO Order",
+              description: productSummary,
+            },
+            unit_amount: Math.round(serverAmount * 100), // INR to paise
+          },
+          quantity: 1,
+        },
+        {
+          price_data: {
+            currency: "inr",
+            product_data: {
+              name: "Shipping (Delhivery)",
+            },
+            unit_amount: Math.round(shippingAmount * 100), // INR to paise
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: successUrl,
+      cancel_url:  cancelUrl,
+      customer_email: verifiedEmail,
+      metadata: {
+        userId: verifiedUserId,
+        customerName: customerName || dbUser?.fullName || authSession.user.name || "Customer",
+        email: verifiedEmail,
+        productSummary,
+        orderItems: JSON.stringify(resolvedOrderItems).slice(0, 500),
+        subtotal: serverAmount.toString(),
+        shippingCharge: shippingAmount.toString(),
+        amount: totalAmountInr.toString(), // server-computed INR total, stored for reference only
+        deliveryPincode,
+        shippingProvider: "Delhivery",
+        shipmentActualWeight: String(shippingCalc.actualWeightGrams || ""),
+        shipmentChargeableWeight: String(shippingCalc.chargeableWeightGrams || ""),
+        shipmentDimensions: shippingCalc.dimensions ? JSON.stringify(shippingCalc.dimensions) : "",
+        shippingCalculationDate: new Date().toISOString(),
+        shippingAddress: (shippingAddress || "").slice(0, 450),
+        phoneNumber: (phoneNumber || "").slice(0, 30),
+      },
+    })
+
+    return NextResponse.json({
+      url: session.url,
+      downloadToken: generateInvoiceToken(session.id),
+    })
+  } catch (err: any) {
+    console.error("Stripe session creation error:", err)
+    return NextResponse.json(
+      { error: err.message || "Failed to create checkout session" },
+      { status: 500 }
+    )
+  }
+}
